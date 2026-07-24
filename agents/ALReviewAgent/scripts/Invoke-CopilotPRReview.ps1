@@ -692,6 +692,49 @@ function Save-TaskContext {
     return $path
 }
 
+function Clear-BCQualityRunArtifacts {
+    # BCQualityRoot is a persistent, reused checkout (self-cloned cache) and is
+    # also the nested agent's working directory. Per-run artifacts are written
+    # here as untracked files, and `git reset --hard` on the checkout does NOT
+    # remove untracked files - so stale artifacts from a previous review linger
+    # across runs. Two concrete hazards this clears:
+    #   1. A stale `_review-report.json` / `_filter-report.json` would be
+    #      harvested as THIS run's findings if the agent fails to write a fresh
+    #      one (silent wrong result).
+    #   2. Stale `_review-changed-files.txt` / `_review-object-index.txt` from a
+    #      prior changeset can mislead the agent about what changed when its
+    #      primary diff access is degraded.
+    # Removing them before the run guarantees the agent and the harvester only
+    # ever see artifacts produced by the current run.
+    if (-not $BCQualityRoot -or -not (Test-Path -LiteralPath $BCQualityRoot)) { return }
+
+    $stalePatterns = @(
+        '_task-context.json',
+        '_review-report.json',
+        '_review-changed-files.txt',
+        '_review-object-index.txt',
+        '_filter-report.json',
+        '_run-metrics.json',
+        '_review-*'
+    )
+
+    $removed = 0
+    foreach ($pattern in $stalePatterns) {
+        foreach ($file in (Get-ChildItem -LiteralPath $BCQualityRoot -File -Filter $pattern -ErrorAction SilentlyContinue)) {
+            try {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                $removed++
+            } catch {
+                Write-Warning "Could not remove stale artifact '$($file.FullName)': $($_.Exception.Message)"
+            }
+        }
+    }
+
+    if ($removed -gt 0) {
+        Write-Host "Cleared $removed stale review artifact(s) from $BCQualityRoot"
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Build Copilot bootstrap prompt
 # ---------------------------------------------------------------------------
@@ -2721,6 +2764,7 @@ if ($ReviewPhase -ne 'generate') {
 # in the generate/all phases; skip them entirely in post.
 $taskContext = $null
 if ($ReviewPhase -ne 'post') {
+    Clear-BCQualityRunArtifacts
     $taskContext = Build-TaskContext
     $null = Save-TaskContext -TaskContext $taskContext
 }
