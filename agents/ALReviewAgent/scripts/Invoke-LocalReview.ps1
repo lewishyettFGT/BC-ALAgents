@@ -162,7 +162,9 @@ function Resolve-BCQualityRoot {
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
         throw 'git is required to fetch BCQuality but was not found on PATH. Pass -BCQualityRoot to use an existing checkout.'
     }
-    $cacheDir = Join-Path $env:USERPROFILE '.copilot/cache/bc-review'
+    # GetFolderPath('UserProfile') is cross-platform (returns $HOME off-Windows);
+    # $env:USERPROFILE is unset on non-Windows PowerShell.
+    $cacheDir = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.copilot/cache/bc-review'
     New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
     $bcqPath = Join-Path $cacheDir 'BCQuality'
     $bcqUrl  = 'https://github.com/microsoft/BCQuality.git'
@@ -521,7 +523,7 @@ try {
     $reportPath = Join-Path $OutputDir '_review-report.json'
     Remove-Item -LiteralPath $sourceReportPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $reportPath -Force -ErrorAction SilentlyContinue
-    $copilotLogDir = Join-Path $env:USERPROFILE '.copilot\logs'
+    $copilotLogDir = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.copilot/logs'
     $preexistingLogs = @{}
     if (Test-Path $copilotLogDir) {
         Get-ChildItem $copilotLogDir -File -ErrorAction SilentlyContinue |
