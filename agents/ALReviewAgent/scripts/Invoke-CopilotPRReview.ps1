@@ -2669,6 +2669,7 @@ $modelDisplay = if ($CopilotModel) {
             }
         } catch {
             # Best-effort; leave $resolvedDefault as $null.
+            Write-Verbose "Could not read default model from ${settingsPath}: $_"
         }
     }
     if ($resolvedDefault) { "(default: $resolvedDefault)" } else { '(default: unknown)' }
