@@ -698,9 +698,9 @@ function Clear-BCQualityRunArtifacts {
     # here as untracked files, and `git reset --hard` on the checkout does NOT
     # remove untracked files - so stale artifacts from a previous review linger
     # across runs. Two concrete hazards this clears:
-    #   1. A stale `_review-report.json` / `_filter-report.json` would be
-    #      harvested as THIS run's findings if the agent fails to write a fresh
-    #      one (silent wrong result).
+    #   1. A stale `_review-report.json` would be harvested as THIS run's
+    #      findings if the agent fails to write a fresh one (silent wrong
+    #      result).
     #   2. Stale `_review-changed-files.txt` / `_review-object-index.txt` from a
     #      prior changeset can mislead the agent about what changed when its
     #      primary diff access is degraded.
@@ -708,12 +708,15 @@ function Clear-BCQualityRunArtifacts {
     # ever see artifacts produced by the current run.
     if (-not $BCQualityRoot -or -not (Test-Path -LiteralPath $BCQualityRoot)) { return }
 
+    # NOTE: _filter-report.json is deliberately NOT cleared here. It is produced
+    # by the upstream BCQuality filter step (before this engine runs) and is
+    # harvested into the output dir AFTER the agent run - clearing it would
+    # delete a live input of the current run.
     $stalePatterns = @(
         '_task-context.json',
         '_review-report.json',
         '_review-changed-files.txt',
         '_review-object-index.txt',
-        '_filter-report.json',
         '_run-metrics.json',
         '_review-*'
     )
