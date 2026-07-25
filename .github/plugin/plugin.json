@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "author": {
     "name": "Business Central",
-    "email": "bc-control-plane@service.microsoft.com"
+    "email": "bc-abs-integration@microsoft.com"
   },
   "repository": "https://github.com/microsoft/BC-ALAgents",
   "license": "MIT",

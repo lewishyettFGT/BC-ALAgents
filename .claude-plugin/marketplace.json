@@ -2,7 +2,7 @@
   "name": "bc-alagents",
   "owner": {
     "name": "Business Central",
-    "email": "bc-control-plane@service.microsoft.com"
+    "email": "bc-abs-integration@microsoft.com"
   },
   "metadata": {
     "description": "BC AL review agent - local AL/BC code review skill packaged with its reviewer engine",
