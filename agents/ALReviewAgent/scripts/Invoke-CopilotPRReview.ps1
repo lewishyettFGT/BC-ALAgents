@@ -117,11 +117,6 @@ $ReviewApplyTo    = $env:REVIEW_APPLY_TO ?? '**'
 # Used by local wrappers to review a subfolder without shadowing the diff at
 # post-processing time. Empty = review the full diff.
 $ReviewPathSpec   = ($env:REVIEW_PATH_SPEC ?? '').Trim()
-# Diff separator between base and HEAD. Default '...' (merge-base semantics —
-# what PR review needs). Set to '..' via REVIEW_DIFF_STYLE=direct when the base
-# is a synthesized commit with no shared ancestry (e.g. local "whole tree"
-# audit mode).
-$ReviewDiffStyle  = if ((($env:REVIEW_DIFF_STYLE ?? '') + '').Trim().ToLowerInvariant() -eq 'direct') { '..' } else { '...' }
 $ReviewOutputDir  = $env:REVIEW_OUTPUT_DIR ?? (Join-Path $TrustedWorkspace 'review-output')
 $BaseBranch       = $env:BASE_BRANCH ?? 'main'
 $AgentLabelRaw    = ($env:COPILOT_REVIEW_AGENT_LABEL ?? '').Trim()
@@ -138,6 +133,14 @@ $AnalysisWorkspace = $env:REVIEW_TARGET_WORKSPACE ?? (Join-Path (Split-Path -Par
 $ReviewSource = (($env:REVIEW_SOURCE ?? 'pr') + '').Trim().ToLowerInvariant()
 $BaseRef = ($env:BASE_REF ?? '').Trim()
 $DiffBaseRef = if ($ReviewSource -eq 'local') { $BaseRef } else { "origin/$BaseBranch" }
+# Diff range used for all change discovery. Default is three-dot
+# ($base...HEAD): the diff from the merge-base of $base and HEAD, which is
+# correct for normal branch/PR reviews. When the caller sets
+# REVIEW_DIFF_STYLE=direct, use two-dot ($base..HEAD) instead. Two-dot is
+# required when $base is a synthesized parent-less commit (e.g. Existing-mode
+# whole-tree review against an empty base), which has no merge-base with HEAD
+# and would make three-dot fail with "no merge base".
+$DiffRange = if ((($env:REVIEW_DIFF_STYLE ?? '') + '').Trim().ToLowerInvariant() -eq 'direct') { "$DiffBaseRef..HEAD" } else { "$DiffBaseRef...HEAD" }
 $SummaryMarker    = '<!-- copilot-pr-review-summary -->'
 $BaseUrl          = "https://api.github.com/repos/$Repository"
 
@@ -458,7 +461,7 @@ function Get-PathSpecArgs {
 }
 
 function Get-GitChangedFiles {
-    $args = @('-C', $AnalysisWorkspace, 'diff', '--name-only', "$DiffBaseRef$ReviewDiffStyle`HEAD") + (Get-PathSpecArgs)
+    $args = @('-C', $AnalysisWorkspace, 'diff', '--name-only', $DiffRange) + (Get-PathSpecArgs)
     $output = Invoke-GitCommand -Arguments $args
     return @($output | Where-Object { $_ -and $_.Trim() })
 }
@@ -468,7 +471,7 @@ function Get-GitFilePatch {
     # Path-scoped diff for a specific file. The pathspec above is only used
     # to narrow the changed-files list; per-file diffs remain unscoped so we
     # still get the full patch for each surviving file.
-    $output = Invoke-GitCommand -Arguments @('-C', $AnalysisWorkspace, 'diff', "$DiffBaseRef$ReviewDiffStyle`HEAD", '--', $FilePath)
+    $output = Invoke-GitCommand -Arguments @('-C', $AnalysisWorkspace, 'diff', $DiffRange, '--', $FilePath)
     return ($output -join "`n")
 }
 
@@ -723,6 +726,52 @@ function Save-TaskContext {
     return $path
 }
 
+function Clear-BCQualityRunArtifacts {
+    # BCQualityRoot is a persistent, reused checkout (self-cloned cache) and is
+    # also the nested agent's working directory. Per-run artifacts are written
+    # here as untracked files, and `git reset --hard` on the checkout does NOT
+    # remove untracked files - so stale artifacts from a previous review linger
+    # across runs. Two concrete hazards this clears:
+    #   1. A stale `_review-report.json` would be harvested as THIS run's
+    #      findings if the agent fails to write a fresh one (silent wrong
+    #      result).
+    #   2. Stale `_review-changed-files.txt` / `_review-object-index.txt` from a
+    #      prior changeset can mislead the agent about what changed when its
+    #      primary diff access is degraded.
+    # Removing them before the run guarantees the agent and the harvester only
+    # ever see artifacts produced by the current run.
+    if (-not $BCQualityRoot -or -not (Test-Path -LiteralPath $BCQualityRoot)) { return }
+
+    # NOTE: _filter-report.json is deliberately NOT cleared here. It is produced
+    # by the upstream BCQuality filter step (before this engine runs) and is
+    # harvested into the output dir AFTER the agent run - clearing it would
+    # delete a live input of the current run.
+    $stalePatterns = @(
+        '_task-context.json',
+        '_review-report.json',
+        '_review-changed-files.txt',
+        '_review-object-index.txt',
+        '_run-metrics.json',
+        '_review-*'
+    )
+
+    $removed = 0
+    foreach ($pattern in $stalePatterns) {
+        foreach ($file in (Get-ChildItem -LiteralPath $BCQualityRoot -File -Filter $pattern -ErrorAction SilentlyContinue)) {
+            try {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                $removed++
+            } catch {
+                Write-Warning "Could not remove stale artifact '$($file.FullName)': $($_.Exception.Message)"
+            }
+        }
+    }
+
+    if ($removed -gt 0) {
+        Write-Host "Cleared $removed stale review artifact(s) from $BCQualityRoot"
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Build Copilot bootstrap prompt
 # ---------------------------------------------------------------------------
@@ -872,9 +921,9 @@ The base branch is: $DiffBaseRef
 The repository is: $reviewLabel
 $pathSpecLine
 Use git commands to analyze the changes:
-- git -C "$prWorktree" --no-pager diff $DiffBaseRef$ReviewDiffStyle`HEAD$pathSpecSuffix to see all changes
-- git -C "$prWorktree" --no-pager diff $DiffBaseRef$ReviewDiffStyle`HEAD -- <file> to see changes in a specific file
-- git -C "$prWorktree" --no-pager diff --name-only $DiffBaseRef$ReviewDiffStyle`HEAD$pathSpecSuffix to list changed files
+- git -C "$prWorktree" --no-pager diff $DiffRange$pathSpecSuffix to see all changes
+- git -C "$prWorktree" --no-pager diff $DiffRange -- <file> to see changes in a specific file
+- git -C "$prWorktree" --no-pager diff --name-only $DiffRange$pathSpecSuffix to list changed files
 
 AUTHORITATIVE WORKLIST:
 The orchestrator already resolved $changedFileCount changed file(s) and wrote
@@ -1960,16 +2009,39 @@ function Resolve-AgentVersion {
         return "$(Resolve-AgentReleaseDate).v$(Resolve-AgentReleaseVersion)"
     }
 
+    # Preferred source: an X.Y.Z tag on the checked-out engine commit. This only
+    # works in a real git checkout; a plugin install is a flattened snapshot with
+    # no .git, so `git tag` fails. In that case fall back to the shipped
+    # plugin.json version rather than aborting the whole review.
     $tagOutput = @(& git -C $EngineRoot tag --points-at HEAD 2>&1)
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not read engine tags: $($tagOutput -join [Environment]::NewLine)"
+    if ($LASTEXITCODE -eq 0) {
+        $version = @($tagOutput | Where-Object { $_ -match '^\d+\.\d+\.\d+$' } | Sort-Object { [version]$_ } -Descending | Select-Object -First 1)
+        if ($version.Count -gt 0) {
+            return [string]$version[0]
+        }
     }
 
-    $version = @($tagOutput | Where-Object { $_ -match '^\d+\.\d+\.\d+$' } | Sort-Object { [version]$_ } -Descending | Select-Object -First 1)
-    if ($version.Count -eq 0) {
-        throw 'The checked-out engine commit has no X.Y.Z tag. Set COPILOT_REVIEW_AGENT_VERSION for an unreleased commit.'
+    $manifestVersion = Get-PluginManifestVersion -EngineRoot $EngineRoot
+    if ($manifestVersion) {
+        return $manifestVersion
     }
-    return [string]$version[0]
+
+    throw 'Could not determine engine version: no X.Y.Z git tag on HEAD and no version in .github/plugin/plugin.json. Set COPILOT_REVIEW_AGENT_VERSION for an unreleased commit.'
+}
+
+function Get-PluginManifestVersion {
+    param([string] $EngineRoot)
+
+    $manifestPath = Join-Path $EngineRoot '.github/plugin/plugin.json'
+    if (-not (Test-Path -LiteralPath $manifestPath)) { return $null }
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return $null
+    }
+    $manifestVersion = ($manifest.version + '').Trim()
+    if ($manifestVersion -notmatch '^\d+\.\d+\.\d+$') { return $null }
+    return $manifestVersion
 }
 
 function Resolve-AgentLabel {
@@ -2806,6 +2878,7 @@ $modelDisplay = if ($CopilotModel) {
             }
         } catch {
             # Best-effort; leave $resolvedDefault as $null.
+            Write-Verbose "Could not read default model from ${settingsPath}: $_"
         }
     }
     if ($resolvedDefault) { "(default: $resolvedDefault)" } else { '(default: unknown)' }
@@ -2826,7 +2899,7 @@ else {
     Checkout-PrBranch
 }
 
-Write-Host "Fetching changed files via git diff ($DiffBaseRef$ReviewDiffStyle`HEAD)"
+Write-Host "Fetching changed files via git diff ($DiffRange)"
 $changedFileNames = @(Get-GitChangedFiles)
 Write-Host "Found $($changedFileNames.Count) changed file(s)"
 $changedFilesManifest = Join-Path $BCQualityRoot '_review-changed-files.txt'
@@ -2881,6 +2954,7 @@ if ($ReviewPhase -ne 'generate') {
 # in the generate/all phases; skip them entirely in post.
 $taskContext = $null
 if ($ReviewPhase -ne 'post') {
+    Clear-BCQualityRunArtifacts
     $taskContext = Build-TaskContext
     $null = Save-TaskContext -TaskContext $taskContext
 }
