@@ -485,8 +485,8 @@ function Get-PathSpecArgs {
 }
 
 function Get-GitChangedFiles {
-    $args = @('-C', $AnalysisWorkspace, 'diff', '--name-only', $DiffRange) + (Get-PathSpecArgs)
-    $output = Invoke-GitCommand -Arguments $args
+    $gitArgs = @('-C', $AnalysisWorkspace, 'diff', '--name-only', $DiffRange) + (Get-PathSpecArgs)
+    $output = Invoke-GitCommand -Arguments $gitArgs
     return @($output | Where-Object { $_ -and $_.Trim() })
 }
 
@@ -3029,7 +3029,9 @@ if ($ReviewPhase -ne 'post') {
                 if ($t -and $t -match $objHeaderRe) { $objIndexLines.Add("$cf`t$t"); break }
             }
         }
-        catch { }
+        catch {
+            Write-Verbose "Could not index AL object header from '$cf': $($_.Exception.Message)"
+        }
     }
     Set-Content -LiteralPath $objectIndexPath -Value $objIndexLines -Encoding UTF8
     Write-LogPhaseDetail "Object index written to $objectIndexPath ($($objIndexLines.Count) objects)"
