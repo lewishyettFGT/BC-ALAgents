@@ -37,7 +37,6 @@
 .NOTES
     Required environment variables:
         GITHUB_TOKEN       - workflow token (write:pull-requests, write:issues)
-        GH_TOKEN           - Copilot-enabled PAT for Copilot CLI auth
         GITHUB_REPOSITORY  - owner/repo
         PR_NUMBER          - pull request number
         PR_HEAD_SHA        - head commit SHA of the pull request
@@ -48,6 +47,9 @@
         REVIEW_WORKSPACE                     - trusted base checkout path (default: GITHUB_WORKSPACE)
         REVIEW_OUTPUT_DIR                    - artifact output folder
         REVIEW_TARGET_WORKSPACE              - detached PR-head worktree path
+        GH_TOKEN                              - Copilot-enabled token for CI/PR
+                                                generation. Local reviews use the
+                                                Copilot CLI credential store.
         COPILOT_MODEL                        - explicit model name for Copilot CLI
         COPILOT_REVIEW_LEAF_MODEL            - faster/cheaper model for leaf sub-skill
                                                child agents (triage tier); empty = default
@@ -297,7 +299,9 @@ function Assert-Config {
 
     if ($ReviewSource -notin @('pr', 'local')) { throw "Unsupported REVIEW_SOURCE: $ReviewSource (expected pr | local)" }
     if ($needsPost -and -not $GithubToken) { throw 'GITHUB_TOKEN is required for posting (REVIEW_PHASE all|post)' }
-    if ($needsCli -and -not $CopilotToken) { throw 'GH_TOKEN is required for Copilot CLI authentication (REVIEW_PHASE all|generate)' }
+    if ($needsCli -and $ReviewSource -ne 'local' -and -not $CopilotToken) {
+        throw 'GH_TOKEN is required for Copilot CLI authentication in PR review mode (REVIEW_PHASE all|generate)'
+    }
     if ($ReviewSource -eq 'local') {
         if (-not $BaseRef) { throw 'BASE_REF is required when REVIEW_SOURCE=local (the base commit/ref to diff the worktree against)' }
         if ($ReviewPhase -eq 'post') { throw 'REVIEW_SOURCE=local does not support REVIEW_PHASE=post (local mode never posts to GitHub)' }
@@ -1100,7 +1104,9 @@ function Invoke-CopilotCli {
     }
     if ($CopilotModel) { $copilotArgs += "--model=$CopilotModel" }
 
-    # Pass only a safe allowlist of env vars to the subprocess; inject Copilot token
+    # Pass only a safe allowlist of env vars to the subprocess. CI generation
+    # injects GH_TOKEN; local reviews deliberately omit it so Copilot CLI uses
+    # its existing credential store under the preserved user-profile paths.
     $allowedKeys = @('PATH','HOME','USERPROFILE','TMP','TEMP','TMPDIR','APPDATA','LOCALAPPDATA',
                      'SystemRoot','ComSpec','CI','TERM','LANG','LC_ALL','npm_config_prefix','NPM_CONFIG_PREFIX')
     $cleanEnv = @{}
@@ -1108,7 +1114,9 @@ function Invoke-CopilotCli {
         $val = [System.Environment]::GetEnvironmentVariable($key)
         if ($val) { $cleanEnv[$key] = $val }
     }
-    $cleanEnv['GH_TOKEN'] = $CopilotToken
+    if ($ReviewSource -ne 'local' -and $CopilotToken) {
+        $cleanEnv['GH_TOKEN'] = $CopilotToken
+    }
     $cleanEnv['CI']       = 'true'
     $cleanEnv['GIT_PAGER'] = 'cat'
     $cleanEnv['PAGER'] = 'cat'
@@ -1119,9 +1127,17 @@ function Invoke-CopilotCli {
     $startedAt = [DateTime]::UtcNow
 
     try {
+        $copilotCommand = Get-Command copilot.exe -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if (-not $copilotCommand) {
+            $copilotCommand = Get-Command copilot -CommandType Application -ErrorAction Stop |
+                Select-Object -First 1
+        }
+
         $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-        $startInfo.FileName               = 'copilot'
+        $startInfo.FileName               = $copilotCommand.Source
         $startInfo.UseShellExecute        = $false
+        $startInfo.CreateNoWindow         = $true
         $startInfo.RedirectStandardInput  = $false
         $startInfo.RedirectStandardOutput = $true
         $startInfo.RedirectStandardError  = $true

@@ -29,9 +29,9 @@ engine resolves its co-located helpers correctly.
 
 - `git` on PATH
 - `pwsh` on PATH (PowerShell 7+)
-- Copilot CLI available (`npm install -g @github/copilot`) - the reviewer subprocess uses it
+- Copilot CLI installed and signed in - the reviewer subprocess reuses its
+  local credential store
 - `powershell-yaml` module (`Install-Module powershell-yaml -Scope CurrentUser -Force` if missing)
-- A Copilot-enabled GitHub credential (`gh auth login`, or `$env:GH_TOKEN`)
 
 If any prerequisite is missing, stop and tell the user exactly what to install.
 

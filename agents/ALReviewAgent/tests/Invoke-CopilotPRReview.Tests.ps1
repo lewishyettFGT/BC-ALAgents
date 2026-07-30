@@ -456,6 +456,7 @@ Describe 'Build-BootstrapPrompt' {
         $Repository = 'microsoft/BCApps'
         $PrNumber = 9479
         $DiffBaseRef = 'origin/main'
+        $DiffRange = 'origin/main...HEAD'
         $ReportFileName = 'findings-report.json'
         $MinimumSeverity = 'Low'
 
@@ -472,6 +473,61 @@ Describe 'Build-BootstrapPrompt' {
         $script:BootstrapPrompt | Should -Not -Match 'diff origin/main to see all changes'
         $script:BootstrapPrompt | Should -Not -Match 'diff origin/main -- <file>'
         $script:BootstrapPrompt | Should -Not -Match 'diff --name-only origin/main to list changed files'
+    }
+}
+
+Describe 'Local review authentication' {
+    BeforeAll {
+        $script:AuthWorkspace = Join-Path $TestDrive 'workspace'
+        $script:AuthBCQuality = Join-Path $TestDrive 'bcquality'
+        New-Item -ItemType Directory -Path $script:AuthWorkspace -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $script:AuthBCQuality 'skills') -Force | Out-Null
+        Set-Content -Path (Join-Path $script:AuthBCQuality 'skills/entry.md') -Value '# entry'
+        & git -C $script:AuthWorkspace init -q
+    }
+
+    BeforeEach {
+        $ReviewPhase = 'generate'
+        $ReviewSource = 'local'
+        $GithubToken = $null
+        $CopilotToken = $null
+        $BaseRef = 'HEAD'
+        $AnalysisWorkspace = $script:AuthWorkspace
+        $TrustedWorkspace = $script:AuthWorkspace
+        $BCQualityRoot = $script:AuthBCQuality
+        $BaseBranch = 'main'
+        $PrNumber = 0
+        $PrHeadSha = $null
+        $MinimumSeverity = 'Low'
+        $AgentMinimumSeverity = 'Low'
+        $CopilotCliTimeoutMinutes = 30
+
+        Mock Get-Command {
+            [pscustomobject]@{ Source = 'copilot' }
+        } -ParameterFilter { $Name -eq 'copilot' }
+    }
+
+    It 'allows local generation without GH_TOKEN' {
+        { Assert-Config } | Should -Not -Throw
+    }
+
+    It 'still requires GH_TOKEN for PR generation' {
+        $ReviewSource = 'pr'
+        $PrNumber = 1
+        $PrHeadSha = 'abc123'
+
+        { Assert-Config } | Should -Throw '*GH_TOKEN is required*'
+    }
+
+    It 'launches the child Copilot process without a visible console window' {
+        $source = Get-Content -LiteralPath $scriptPath -Raw
+        $source | Should -Match '\$startInfo\.CreateNoWindow\s*=\s*\$true'
+        $source | Should -Match 'Get-Command copilot\.exe'
+    }
+
+    It 'does not forward an inherited GH_TOKEN to the local child process' {
+        $source = Get-Content -LiteralPath $scriptPath -Raw
+        $source | Should -Match "if \(\`$ReviewSource -ne 'local' -and \`$CopilotToken\)"
     }
 }
 
