@@ -339,13 +339,6 @@ function Resolve-BranchBase {
     throw "Could not determine base ref. Pass -BaseRef explicitly."
 }
 
-function Get-Auth-Token {
-    if ($env:GH_TOKEN) { return $env:GH_TOKEN }
-    $t = & gh auth token 2>$null
-    if ($LASTEXITCODE -eq 0 -and $t) { return $t.Trim() }
-    throw "No Copilot CLI credential found. Set `$env:GH_TOKEN or run 'gh auth login'."
-}
-
 # ---------------------------------------------------------------------------
 # Prep: figure out base + optionally stage staged-changes into a temp commit
 # ---------------------------------------------------------------------------
@@ -476,7 +469,6 @@ try {
     $env:BCQUALITY_CONFIG_PATH   = $ConfigPath
     $env:GITHUB_REPOSITORY       = 'local/local'    # placeholder, unused in local mode
     $env:MINIMUM_SEVERITY        = $MinimumSeverity
-    $env:GH_TOKEN                = Get-Auth-Token
     # Local runs commonly need the agent to touch git.exe / pwsh.exe outside
     # the target folder. Broaden the CLI sandbox for the local path only.
     $env:COPILOT_ALLOW_ALL_PATHS = 'true'
