@@ -149,10 +149,17 @@ Append the `(fix available)` marker only when that finding has
 `suggested-code`. Sort domains by highest severity present, then by count.
 
 **D. Next steps** - a short bullet list tailored to what was found:
-- If any finding has `suggested-code`: "N of M findings have auto-appliable
-  fixes - say *fix them* to apply."
-- Offer the most relevant follow-ups from step 4 (e.g. narrow to criticals,
-  scope to a folder).
+- End every review with this numbered fix menu:
+  1. **Apply reviewer fixes** - apply literal `suggested-code` replacements;
+     normally seconds and no additional AI credits. If none are available,
+     label this option unavailable.
+  2. **Fix with an AI agent** - fix selected findings from the existing report;
+     does not rerun review.
+  3. **Fix and verify** - apply fixes, then check only the original findings
+     and report resolved versus remaining; no full review.
+  4. **Fix and review again** - apply fixes, then run a fresh complete review;
+     slowest option and consumes new review AI credits.
+- Include the number of mechanically fixable findings beside option 1.
 - Full details: point to the `_review-report.json` and `_run-metrics.json`
   paths.
 
@@ -183,7 +190,36 @@ prose. The user can drill into any finding on request.
 
 Anticipate and offer:
 
-- **"fix them"** / **"apply the fixes"** -> re-run with `-Fix` (and optionally a higher `-MinimumSeverity` to limit scope). Fixes land in the worktree; do NOT commit unless asked. After a `-Fix` run, re-summarize: state which files were modified and that changes are staged in the worktree (uncommitted), then suggest the user review the diff.
+- If the user asks to fix findings without naming a method, use `ask_user` with
+  the same four numbered options shown in the report. Recommend **Apply reviewer
+  fixes** when at least one suggestion exists; otherwise recommend **Fix with
+  an AI agent**. Do not silently choose the expensive path.
+- **"apply reviewer fixes"** / selecting option 1 after a completed review ->
+  do **not**
+  rerun the review or launch another Copilot agent. Invoke the co-located
+  deterministic fixer instead:
+  `<skill-dir>/../../scripts/Apply-LocalReviewSuggestions.ps1 -RepoPath <repo>
+  -ReportPath <output-dir>/_review-report.json -MinimumSeverity <level>`.
+  It applies only literal `suggested-code` replacements and normally completes
+  in seconds. Read `_fix-results.json`, report which files were modified, and
+  clearly list findings skipped because they require judgment. Do not commit.
+- **"review and fix"** in the initial request -> run once with `-Fix`; this may
+  use an AI fix pass for findings without mechanical suggestions.
+- **"use AI to fix the remaining findings"** -> invoke
+  `<skill-dir>/../../scripts/Invoke-LocalReviewFixes.ps1 -RepoPath <repo>
+  -ReportPath <output-dir>/_review-report.json -MinimumSeverity <level>
+  -OnlyWithoutSuggestedCode`. This launches one fix agent against the existing
+  report and does **not** rerun the review. To fix one issue, additionally pass
+  `-FindingId <finding-id>`.
+- **"fix and verify"** -> apply reviewer suggestions, use the AI fix-only pass
+  for remaining selected findings, then inspect only the original finding
+  locations and classify each as resolved or remaining. Do not run the review
+  engine again.
+- **"fix and review again"** -> apply fixes, then run a new review with the
+  original mode, severity, base, and path scope. Explain before starting that
+  this is a full new review with comparable runtime and AI-credit usage. In
+  Branch mode, unstaged fixes are not included; ask before staging or otherwise
+  changing git state so the fresh review can see them.
 - **"only criticals"** -> re-run with `-MinimumSeverity Critical`.
 - **"show me finding N"** -> open the referenced file/line.
 - **"review against release-24"** -> re-run with `-BaseRef origin/release-24`.
