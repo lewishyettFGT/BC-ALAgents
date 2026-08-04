@@ -566,3 +566,137 @@ Describe 'Repair-ShellEscapedQuotes' {
         Repair-ShellEscapedQuotes -Text $null | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Get-RegionalPathInfo' {
+    It 'parses an src/Apps regional path' {
+        $info = Get-RegionalPathInfo -FilePath 'src/Apps/US/Sales/Foo.Codeunit.al'
+        $info.Tree | Should -Be 'apps'
+        $info.Region | Should -Be 'us'
+        $info.Relative | Should -Be 'Sales/Foo.Codeunit.al'
+    }
+
+    It 'parses an src/Layers regional path and normalizes backslashes/case' {
+        $info = Get-RegionalPathInfo -FilePath '\src\Layers\W1\Bar.al'
+        $info.Tree | Should -Be 'layers'
+        $info.Region | Should -Be 'w1'
+        $info.Path | Should -Be 'src/Layers/W1/Bar.al'
+    }
+
+    It 'returns null for a non-regional path' {
+        Get-RegionalPathInfo -FilePath 'src/System Application/Foo.al' | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-FindingOtherRegions' {
+    It 'returns an empty array when the property is absent (StrictMode-safe)' {
+        (Get-FindingOtherRegions -Finding ([pscustomobject]@{ filePath = 'x' })).Count | Should -Be 0
+    }
+}
+
+Describe 'Group-RegionalFindings' {
+    BeforeAll {
+        function New-RegionalFinding {
+            param([string] $Path, [int] $Line = 10, [string] $Issue = 'Avoid N+1 query', [string] $Rec = 'Use SetLoadFields')
+            [pscustomobject]@{
+                filePath = $Path; lineNumber = $Line; severity = 'Medium'
+                domain = 'Performance'; issue = $Issue; recommendation = $Rec
+            }
+        }
+    }
+
+    It 'collapses an identical finding across regions and prefers W1 as primary' {
+        $findings = @(
+            New-RegionalFinding -Path 'src/Apps/US/Foo.al' -Line 42
+            New-RegionalFinding -Path 'src/Apps/W1/Foo.al' -Line 42
+            New-RegionalFinding -Path 'src/Apps/DE/Foo.al' -Line 42
+        )
+        $result = @(Group-RegionalFindings -Findings $findings)
+        $result.Count | Should -Be 1
+        $result[0].filePath | Should -Be 'src/Apps/W1/Foo.al'
+        $others = Get-FindingOtherRegions -Finding $result[0]
+        $others.Count | Should -Be 2
+        ($others | ForEach-Object { $_.region }) | Should -Be @('DE', 'US')
+        $others[0].line | Should -Be 42
+    }
+
+    It 'picks a deterministic primary when no W1 copy is present' {
+        $findings = @(
+            New-RegionalFinding -Path 'src/Apps/US/Foo.al' -Line 42
+            New-RegionalFinding -Path 'src/Apps/DE/Foo.al' -Line 42
+        )
+        $result = @(Group-RegionalFindings -Findings $findings)
+        $result.Count | Should -Be 1
+        $result[0].filePath | Should -Be 'src/Apps/DE/Foo.al'
+        (Get-FindingOtherRegions -Finding $result[0]).region | Should -Be 'US'
+    }
+
+    It 'collapses regional copies even when the model wording differs per file' {
+        # The real-world driver for keying on location, not text: for byte-identical
+        # regional copies the model still writes DIFFERENT issue/recommendation prose
+        # per file (it may even cross-reference the other copy). Location must still
+        # collapse them into one comment.
+        $findings = @(
+            New-RegionalFinding -Path 'src/Layers/W1/AlCosting/Foo.Codeunit.al' -Line 7 -Issue 'Missing SetLoadFields before Get' -Rec 'Add SetLoadFields'
+            New-RegionalFinding -Path 'src/Layers/BE/AlCosting/Foo.Codeunit.al' -Line 7 -Issue 'Same issue as the W1 copy: no SetLoadFields' -Rec 'Add a SetLoadFields call'
+        )
+        $result = @(Group-RegionalFindings -Findings $findings)
+        $result.Count | Should -Be 1
+        $result[0].filePath | Should -Be 'src/Layers/W1/AlCosting/Foo.Codeunit.al'
+        $others = Get-FindingOtherRegions -Finding $result[0]
+        $others.Count | Should -Be 1
+        $others[0].region | Should -Be 'BE'
+    }
+
+    It 'does not collapse findings at different lines of the same file across regions' {
+        $findings = @(
+            New-RegionalFinding -Path 'src/Apps/US/Foo.al' -Line 10
+            New-RegionalFinding -Path 'src/Apps/W1/Foo.al' -Line 20
+        )
+        (Group-RegionalFindings -Findings $findings).Count | Should -Be 2
+    }
+
+    It 'does not collapse identical findings that stay within one region' {
+        $findings = @(
+            New-RegionalFinding -Path 'src/Apps/US/Foo.al' -Line 10
+            New-RegionalFinding -Path 'src/Apps/US/Bar.al' -Line 99
+        )
+        $result = @(Group-RegionalFindings -Findings $findings)
+        $result.Count | Should -Be 2
+        (Get-FindingOtherRegions -Finding $result[0]).Count | Should -Be 0
+    }
+
+    It 'leaves a non-regional finding untouched even if it shares a signature' {
+        $findings = @(
+            New-RegionalFinding -Path 'src/Apps/US/Foo.al'
+            New-RegionalFinding -Path 'src/Apps/W1/Foo.al'
+            New-RegionalFinding -Path 'src/System Application/Foo.al'
+        )
+        $result = @(Group-RegionalFindings -Findings $findings)
+        $result.Count | Should -Be 2
+        ($result | Where-Object { $_.filePath -eq 'src/System Application/Foo.al' }).Count | Should -Be 1
+    }
+}
+
+Describe 'Format-OtherRegionsNotice' {
+    It 'renders a bullet list of the other regional copies' {
+        $finding = [pscustomobject]@{ otherRegions = @(
+            [pscustomobject]@{ path = 'src/Apps/US/Foo.al'; line = 42; region = 'US' }
+        ) }
+        $notice = Format-OtherRegionsNotice -Finding $finding
+        $notice | Should -Match 'regional copies'
+        $notice | Should -Match 'src/Apps/US/Foo.al:42`'
+        $notice | Should -Match '\(US\)'
+    }
+
+    It 'returns an empty string when there are no other regions (under StrictMode)' {
+        # Regression guard: Get-FindingOtherRegions returns @() when the property is
+        # absent, but a function's empty-array return unrolls to $null on assignment,
+        # so a naive $others.Count throws under Set-StrictMode -Version Latest (the mode
+        # the orchestrator runs under). Pester does not enable StrictMode, so assert it
+        # explicitly here on the common non-collapsed-finding path.
+        & {
+            Set-StrictMode -Version Latest
+            Format-OtherRegionsNotice -Finding ([pscustomobject]@{ filePath = 'x' })
+        } | Should -Be ''
+    }
+}
