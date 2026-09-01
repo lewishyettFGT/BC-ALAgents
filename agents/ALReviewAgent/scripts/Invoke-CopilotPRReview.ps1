@@ -159,7 +159,24 @@ $DiffBaseRef = if ($ReviewSource -eq 'local') { $BaseRef } else { "origin/$BaseB
 # and would make three-dot fail with "no merge base".
 $DiffRange = if ((($env:REVIEW_DIFF_STYLE ?? '') + '').Trim().ToLowerInvariant() -eq 'direct') { "$DiffBaseRef..HEAD" } else { "$DiffBaseRef...HEAD" }
 $SummaryMarker    = '<!-- copilot-pr-review-summary -->'
-$BaseUrl          = "https://api.github.com/repos/$Repository"
+
+# Review host. Selects which pull-request backend the post phase reads existing
+# comments from and writes findings to. 'github' (default) = GitHub REST API;
+# 'azuredevops' = Azure DevOps pull-request threads API. The provider file
+# (scripts/providers/<name>Provider.ps1) defines the uniform surface consumed
+# below: Get-PrFiles / Get-ReviewComments / Get-IssueComments /
+# New-ReviewComment / New-IssueComment / Update-IssueComment.
+$ReviewProvider = (($env:REVIEW_PROVIDER ?? 'github') + '').Trim().ToLowerInvariant()
+# Host used for the per-invocation git credential injected by
+# Invoke-GitCommandAuthenticated (PR-head fetch). Defaults per provider.
+$DefaultGitHost = if ($ReviewProvider -eq 'azuredevops') { 'dev.azure.com' } else { 'github.com' }
+$ReviewGitHost = (($env:REVIEW_GIT_HOST ?? $DefaultGitHost) + '').Trim()
+
+switch ($ReviewProvider) {
+    'github'      { . (Join-Path $PSScriptRoot 'providers/GitHubProvider.ps1') }
+    'azuredevops' { . (Join-Path $PSScriptRoot 'providers/AzureDevOpsProvider.ps1') }
+    default       { throw "Unsupported REVIEW_PROVIDER: '$ReviewProvider' (expected github | azuredevops)" }
+}
 
 # Review phase. Splits the privileged single-job runner into a minimal-
 # permission "generate" phase (runs the tool-enabled Copilot CLI with a
@@ -233,11 +250,14 @@ $script:CopilotOtelMalformedRecords = 0
 # (no GITHUB_ACTIONS) we degrade to plain prefixed lines.
 # ---------------------------------------------------------------------------
 $script:IsGitHubActions = (($env:GITHUB_ACTIONS ?? '') -eq 'true')
+$script:IsAzureDevOps   = (($env:TF_BUILD ?? '') -eq 'True')
 
 function Write-LogGroup {
     param([string] $Title)
     if ($script:IsGitHubActions) {
         Write-Host "::group::$Title"
+    } elseif ($script:IsAzureDevOps) {
+        Write-Host "##[group]$Title"
     } else {
         Write-Host ''
         Write-Host "--- $Title ---"
@@ -247,6 +267,8 @@ function Write-LogGroup {
 function Pop-LogGroup {
     if ($script:IsGitHubActions) {
         Write-Host '::endgroup::'
+    } elseif ($script:IsAzureDevOps) {
+        Write-Host '##[endgroup]'
     } else {
         Write-Host '--- end ---'
     }
@@ -270,6 +292,8 @@ function Write-LogNotice {
     param([string] $Title, [string] $Message)
     if ($script:IsGitHubActions) {
         Write-Host "::notice title=$Title::$(Format-AnnotationMessage $Message)"
+    } elseif ($script:IsAzureDevOps) {
+        Write-Host "##[command]$Title — $Message"
     } else {
         Write-Host "[NOTICE] $Title — $Message"
     }
@@ -279,6 +303,8 @@ function Write-LogWarn {
     param([string] $Title, [string] $Message)
     if ($script:IsGitHubActions) {
         Write-Host "::warning title=$Title::$(Format-AnnotationMessage $Message)"
+    } elseif ($script:IsAzureDevOps) {
+        Write-Host "##vso[task.logissue type=warning]$Title — $($Message -replace "`r?`n", ' ')"
     } else {
         Write-Warning "$Title — $Message"
     }
@@ -288,6 +314,8 @@ function Write-LogErr {
     param([string] $Title, [string] $Message)
     if ($script:IsGitHubActions) {
         Write-Host "::error title=$Title::$(Format-AnnotationMessage $Message)"
+    } elseif ($script:IsAzureDevOps) {
+        Write-Host "##vso[task.logissue type=error]$Title — $($Message -replace "`r?`n", ' ')"
     } else {
         Write-Host "[ERROR] $Title — $Message"
     }
@@ -312,7 +340,13 @@ function Assert-Config {
     $needsPost = ($ReviewPhase -in @('all', 'post')) -and ($ReviewSource -ne 'local')
 
     if ($ReviewSource -notin @('pr', 'local')) { throw "Unsupported REVIEW_SOURCE: $ReviewSource (expected pr | local)" }
-    if ($needsPost -and -not $GithubToken) { throw 'GITHUB_TOKEN is required for posting (REVIEW_PHASE all|post)' }
+    if ($ReviewProvider -notin @('github', 'azuredevops')) { throw "Unsupported REVIEW_PROVIDER: $ReviewProvider (expected github | azuredevops)" }
+    if ($needsPost -and $ReviewProvider -eq 'github' -and -not $GithubToken) {
+        throw 'GITHUB_TOKEN is required for posting (REVIEW_PHASE all|post, REVIEW_PROVIDER=github)'
+    }
+    if ($needsPost -and $ReviewProvider -eq 'azuredevops' -and -not ($env:AZURE_DEVOPS_TOKEN ?? $env:SYSTEM_ACCESSTOKEN)) {
+        throw 'SYSTEM_ACCESSTOKEN (or AZURE_DEVOPS_TOKEN) is required for posting (REVIEW_PHASE all|post, REVIEW_PROVIDER=azuredevops)'
+    }
     if ($needsCli -and $ReviewSource -ne 'local' -and -not $CopilotToken) {
         throw 'GH_TOKEN is required for Copilot CLI authentication in PR review mode (REVIEW_PHASE all|generate)'
     }
@@ -362,91 +396,23 @@ function Assert-Config {
 }
 
 # ---------------------------------------------------------------------------
-# GitHub API helpers
+# Review-host API helpers
+#
+# The concrete implementations of the pull-request surface consumed below live
+# in scripts/providers/<name>Provider.ps1 and were dot-sourced above per
+# $ReviewProvider. Each provider defines, with identical signatures and
+# return-object shapes:
+#
+#   Get-PrFiles                      -> [] (advisory; the diff is taken locally)
+#   Get-ReviewComments               -> inline comments as objects exposing
+#                                       .body .path .line .original_line .side .id
+#   Get-IssueComments                -> PR-level comments exposing .body .id
+#   New-ReviewComment  -Body -Path -Line -Side [-StartLine -StartSide]
+#   New-IssueComment   -Body
+#   Update-IssueComment -CommentId -Body
+#
+# Nothing else in this script talks to the review host directly.
 # ---------------------------------------------------------------------------
-function Invoke-GitHubApi {
-    param(
-        [string] $Method,
-        [string] $Endpoint,
-        [hashtable] $Query,
-        [object]  $Body
-    )
-
-    $url = "$BaseUrl$Endpoint"
-    if ($Query) {
-        $qs = ($Query.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '&'
-        $url = "${url}?$qs"
-    }
-
-    $headers = @{
-        Accept        = 'application/vnd.github+json'
-        Authorization = "Bearer $GithubToken"
-        'User-Agent'  = 'bcapps-copilot-pr-reviewer'
-    }
-
-    $params = @{
-        Uri     = $url
-        Method  = $Method
-        Headers = $headers
-    }
-
-    if ($Body) {
-        $params.Body        = ($Body | ConvertTo-Json -Depth 10 -Compress)
-        $params.ContentType = 'application/json'
-    }
-
-    return Invoke-RestMethod @params
-}
-
-function Get-AllPages {
-    param([string] $Endpoint)
-
-    $all  = [System.Collections.Generic.List[object]]::new()
-    $page = 1
-    do {
-        $result = Invoke-GitHubApi -Method GET -Endpoint $Endpoint -Query @{ per_page = 100; page = $page }
-        if (-not $result) { break }
-        $all.AddRange([object[]]$result)
-        $page++
-    } while ($result.Count -eq 100)
-
-    return $all.ToArray()
-}
-
-function Get-PrFiles        { return Get-AllPages "/pulls/$PrNumber/files" }
-function Get-ReviewComments { return Get-AllPages "/pulls/$PrNumber/comments" }
-function Get-IssueComments  { return Get-AllPages "/issues/$PrNumber/comments" }
-
-function New-ReviewComment {
-    param(
-        [string] $Body, [string] $Path, [int] $Line, [string] $Side,
-        [int] $StartLine = 0, [string] $StartSide = ''
-    )
-
-    if (-not $Line -or -not $Side) {
-        throw 'Inline review comments require both line and side.'
-    }
-
-    $payload = @{ body = $Body; commit_id = $PrHeadSha; path = $Path; line = $Line; side = $Side }
-    # Multi-line comment: GitHub anchors the range over [start_line, line] so a
-    # ```suggestion``` block replaces every spanned line in place (a single-line
-    # comment would otherwise replace just $Line, duplicating context).
-    if ($StartLine -gt 0 -and $StartLine -lt $Line) {
-        $payload.start_line = $StartLine
-        $payload.start_side = if ($StartSide) { $StartSide } else { $Side }
-    }
-    Invoke-GitHubApi -Method POST -Endpoint "/pulls/$PrNumber/comments" -Body $payload
-}
-
-function New-IssueComment {
-    param([string] $Body)
-    Invoke-GitHubApi -Method POST -Endpoint "/issues/$PrNumber/comments" -Body @{ body = $Body }
-}
-
-function Update-IssueComment {
-    param([long] $CommentId, [string] $Body)
-    Invoke-GitHubApi -Method PATCH -Endpoint "/issues/comments/$CommentId" -Body @{ body = $Body }
-}
 
 function New-CopilotChildEnvironment {
     param(
@@ -504,16 +470,21 @@ function Invoke-GitCommand {
 function Invoke-GitCommandAuthenticated {
     param([string[]] $Arguments)
 
-    # The generate phase carries GH_TOKEN; the post phase carries GITHUB_TOKEN.
-    # Either can authenticate a contents:read fetch, so use whichever is present.
-    $token = if ($CopilotToken) { $CopilotToken } else { $GithubToken }
+    # github: the generate phase carries GH_TOKEN, the post phase GITHUB_TOKEN;
+    # either can authenticate a contents:read fetch. azuredevops: the PR-head
+    # fetch targets the Azure DevOps repo, so use an Azure DevOps token
+    # (a read-only PAT when isolating the generate phase, else SYSTEM_ACCESSTOKEN).
+    $token = if ($ReviewProvider -eq 'azuredevops') {
+        $env:AZURE_DEVOPS_READ_TOKEN ?? $env:AZURE_DEVOPS_TOKEN ?? $env:SYSTEM_ACCESSTOKEN
+    } elseif ($CopilotToken) { $CopilotToken } else { $GithubToken }
     if (-not $token) {
         return Invoke-GitCommand -Arguments $Arguments
     }
 
-    $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("x-access-token:$token"))
+    $user = if ($ReviewProvider -eq 'azuredevops') { '' } else { 'x-access-token' }
+    $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${user}:$token"))
     $env:GIT_CONFIG_COUNT = '1'
-    $env:GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader'
+    $env:GIT_CONFIG_KEY_0 = "http.https://$ReviewGitHost/.extraheader"
     $env:GIT_CONFIG_VALUE_0 = "AUTHORIZATION: basic $basic"
     try {
         return Invoke-GitCommand -Arguments $Arguments

@@ -1,0 +1,46 @@
+# Merge-validation gate for the engine scripts — Azure DevOps port of
+# .github/workflows/ci.yml. Add as a Build Validation branch policy on the
+# default branch. Parse errors and Error-severity lint issues fail the build;
+# warnings are printed but do not block.
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr: none   # attach as a Build Validation policy instead
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - checkout: self
+
+  - pwsh: |
+      $failed = $false
+      Get-ChildItem agents/ALReviewAgent/scripts -Filter *.ps1 -Recurse | ForEach-Object {
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) {
+              $failed = $true
+              Write-Host "##vso[task.logissue type=error]$($_.FullName): $($errors.Count) parse error(s)"
+              $errors | ForEach-Object { Write-Host "  line $($_.Extent.StartLineNumber): $($_.Message)" }
+          } else {
+              Write-Host "OK: $($_.Name)"
+          }
+      }
+      if ($failed) { throw 'PowerShell parse errors found.' }
+    displayName: Parse-check PowerShell scripts
+
+  - pwsh: Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+    displayName: Install PSScriptAnalyzer
+
+  - pwsh: |
+      $results = @(Invoke-ScriptAnalyzer -Path agents/ALReviewAgent/scripts -Recurse -Settings ./PSScriptAnalyzerSettings.psd1)
+      $errors   = @($results | Where-Object Severity -eq 'Error')
+      $warnings = @($results | Where-Object Severity -eq 'Warning')
+      foreach ($e in $errors)   { Write-Host "##vso[task.logissue type=error;sourcepath=$($e.ScriptPath);linenumber=$($e.Line)][$($e.RuleName)] $($e.Message)" }
+      foreach ($w in $warnings) { Write-Host "##vso[task.logissue type=warning;sourcepath=$($w.ScriptPath);linenumber=$($w.Line)][$($w.RuleName)] $($w.Message)" }
+      Write-Host "PSScriptAnalyzer: $($errors.Count) error(s), $($warnings.Count) warning(s)"
+      if ($errors.Count -gt 0) { throw "PSScriptAnalyzer found $($errors.Count) error-severity issue(s)." }
+    displayName: Lint (fail on Error severity)

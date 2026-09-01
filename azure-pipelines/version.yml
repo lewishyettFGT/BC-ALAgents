@@ -1,0 +1,60 @@
+# Publishes a new engine version on every merge to main — Azure DevOps port of
+# .github/workflows/version.yml.
+#
+# Version format X.Y.Z: X fixed at 1, Y increments per main commit, Z is the
+# minor of the pinned BCQuality content version. Existing X.Y.Z git tags are the
+# only version state; re-running for an already-tagged commit is a no-op.
+#
+# Requires: the build identity needs "Create tag" and generic "Contribute" on
+# the repo. This pipeline pushes tags with the checkout's persisted credentials.
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr: none
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - checkout: self
+    fetchDepth: 0
+    persistCredentials: true
+
+  - bash: |
+      set -euo pipefail
+      git fetch --tags --force --quiet
+
+      sha="$(git rev-parse HEAD)"
+      version="$(git tag --points-at "$sha" --list '[0-9]*.[0-9]*.[0-9]*' | { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -1)"
+      if [[ -n "$version" ]]; then
+        echo "Commit already tagged as ${version}."
+        echo "##vso[task.setvariable variable=exists]true"
+      else
+        latest="$(git tag --list '1.*.*' | { grep -E '^1\.[0-9]+\.[0-9]+$' || true; } | sort -t. -k2,2n -k3,3n | tail -1)"
+        engine_version=0
+        if [[ -n "$latest" ]]; then IFS='.' read -r _ engine_version _ <<< "$latest"; fi
+        bcq_full="$({ grep -E '^[[:space:]]*version:[[:space:]]*"?[0-9]+\.[0-9]+' agents/ALReviewAgent/bcquality.config.yaml || true; } | head -1 | { grep -oE '[0-9]+\.[0-9]+' || true; } | head -1)"
+        if [[ -z "$bcq_full" ]]; then
+          echo "##vso[task.logissue type=error]bcquality.config.yaml must contain a major.minor BCQuality version"
+          exit 1
+        fi
+        version="1.$((engine_version + 1)).${bcq_full#*.}"
+        echo "##vso[task.setvariable variable=exists]false"
+      fi
+      echo "##vso[task.setvariable variable=version]$version"
+      echo "Computed engine version: $version"
+    displayName: Compute version
+
+  - bash: |
+      set -euo pipefail
+      git config user.name  'Azure Pipelines'
+      git config user.email 'noreply@dev.azure.com'
+      git tag "$(version)" "$(Build.SourceVersion)"
+      git tag -f latest "$(Build.SourceVersion)"
+      git push origin "$(version)"
+      git push origin --force latest
+    displayName: Create and push tags
+    condition: eq(variables.exists, 'false')

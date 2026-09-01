@@ -11,24 +11,34 @@
 param()
 
 BeforeAll {
-    $scriptPath = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts') 'Invoke-CopilotPRReview.ps1'
-    $tokens = $null
-    $parseErrors = $null
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-        $scriptPath,
-        [ref]$tokens,
-        [ref]$parseErrors
+    $scriptsDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts'
+    # The orchestrator dot-sources a review-host provider at run time; the tests
+    # load the orchestrator's own functions plus the default (GitHub) provider's,
+    # so mocks for Get-ReviewComments / New-IssueComment / ... resolve.
+    $sourceFiles = @(
+        (Join-Path $scriptsDir 'Invoke-CopilotPRReview.ps1')
+        (Join-Path $scriptsDir 'providers/GitHubProvider.ps1')
     )
-    if ($parseErrors.Count -gt 0) {
-        throw ($parseErrors | ForEach-Object Message | Out-String)
-    }
 
-    $ast.FindAll({
-        param($node)
-        $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
-    }, $true) | ForEach-Object {
-        $functionDefinition = [scriptblock]::Create($_.Extent.Text)
-        . $functionDefinition
+    foreach ($scriptPath in $sourceFiles) {
+        $tokens = $null
+        $parseErrors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            $scriptPath,
+            [ref]$tokens,
+            [ref]$parseErrors
+        )
+        if ($parseErrors.Count -gt 0) {
+            throw ($parseErrors | ForEach-Object Message | Out-String)
+        }
+
+        $ast.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+        }, $true) | ForEach-Object {
+            $functionDefinition = [scriptblock]::Create($_.Extent.Text)
+            . $functionDefinition
+        }
     }
 
     $DomainMap = @{

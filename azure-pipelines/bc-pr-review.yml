@@ -1,0 +1,135 @@
+# Business Central AL pull-request review — Azure DevOps port of
+# .github/workflows/review.yml.
+#
+# Two stages mirror the GitHub review/publish job split:
+#
+#   Review   read-only. Fetches + filters BCQuality, runs the tool-enabled
+#            GitHub Copilot CLI over the untrusted PR diff, writes findings to
+#            a pipeline artifact. Never receives a token that can write to the PR.
+#   Publish  no model. Downloads the artifact and posts the findings as PR
+#            threads. This is the only stage that maps System.AccessToken.
+#
+# HOW TO WIRE IT UP
+#   1. Create this pipeline from this YAML.
+#   2. Add a variable group `bc-pr-review` containing:
+#        COPILOT_GH_TOKEN        (secret) GitHub token with Copilot entitlement
+#        AZURE_DEVOPS_READ_TOKEN (secret, optional) read-only PAT for the Review
+#                                stage's PR-head fetch. If omitted, the Review
+#                                stage falls back to System.AccessToken, which
+#                                weakens the read-only isolation (see docs).
+#   3. Grant the build identity "Contribute to pull requests" on the repo
+#      (Project Settings > Repositories > Security > "<Project> Build Service").
+#   4. Add this pipeline as a Build Validation branch policy on your default
+#      branch so it runs on every PR (the `pr:` key below is ignored by Azure
+#      Repos — policy is configured in the branch's protection settings).
+
+trigger: none
+pr: none            # PR runs come from the Build Validation branch policy
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: bc-pr-review
+  - name: BCQUALITY_CONFIG_PATH
+    value: agents/ALReviewAgent/bcquality.config.yaml
+  - name: MINIMUM_SEVERITY
+    value: Medium
+
+stages:
+  - stage: Review
+    displayName: Generate findings (read-only)
+    jobs:
+      - job: review
+        displayName: Copilot review
+        timeoutInMinutes: 60
+        steps:
+          - checkout: self
+            fetchDepth: 0
+            persistCredentials: false
+
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '24.x'
+
+          - pwsh: npm install --global @github/copilot
+            displayName: Install Copilot CLI
+
+          - pwsh: Install-Module powershell-yaml -Scope CurrentUser -Force -AllowClobber
+            displayName: Install powershell-yaml
+
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $cfg = & ./agents/ALReviewAgent/scripts/Get-BCQualityConfig.ps1
+              $root = "$(Agent.TempDirectory)/bcquality"
+              New-Item -ItemType Directory -Force -Path $root | Out-Null
+              git -C $root init -q
+              git -C $root remote add origin $cfg.bcquality.repo
+              git -C $root fetch --depth=1 origin $cfg.bcquality.ref
+              git -C $root checkout -q FETCH_HEAD
+              $sha = (git -C $root rev-parse HEAD).Trim()
+              & ./agents/ALReviewAgent/scripts/Invoke-BCQualityFilter.ps1 -BCQualityRoot $root -Config $cfg | Out-Null
+              Write-Host "##vso[task.setvariable variable=BCQUALITY_ROOT]$root"
+              Write-Host "##vso[task.setvariable variable=BCQUALITY_SHA]$sha"
+            displayName: Fetch and filter BCQuality
+
+          - pwsh: |
+              $ErrorActionPreference = 'Stop'
+              $target = "refs/heads/$($env:SYSTEM_PULLREQUEST_TARGETBRANCHNAME)"
+              if (-not $env:SYSTEM_PULLREQUEST_TARGETBRANCHNAME) {
+                  $target = $env:SYSTEM_PULLREQUEST_TARGETBRANCH -replace '^refs/heads/', ''
+              }
+              & ./agents/ALReviewAgent/scripts/Invoke-CopilotPRReview.ps1
+            displayName: Run Copilot PR review (generate)
+            env:
+              REVIEW_PHASE: generate
+              REVIEW_PROVIDER: azuredevops
+              GH_TOKEN: $(COPILOT_GH_TOKEN)
+              AZURE_DEVOPS_READ_TOKEN: $(AZURE_DEVOPS_READ_TOKEN)
+              GITHUB_REPOSITORY: $(Build.Repository.Name)
+              PR_NUMBER: $(System.PullRequest.PullRequestId)
+              PR_HEAD_SHA: $(System.PullRequest.SourceCommitId)
+              BASE_BRANCH: $(System.PullRequest.TargetBranchName)
+              REVIEW_WORKSPACE: $(Build.SourcesDirectory)
+              REVIEW_OUTPUT_DIR: $(Build.ArtifactStagingDirectory)/review-output
+              BCQUALITY_ROOT: $(BCQUALITY_ROOT)
+              BCQUALITY_SHA: $(BCQUALITY_SHA)
+              BCQUALITY_CONFIG_PATH: $(Build.SourcesDirectory)/$(BCQUALITY_CONFIG_PATH)
+              MINIMUM_SEVERITY: $(MINIMUM_SEVERITY)
+
+          - publish: $(Build.ArtifactStagingDirectory)/review-output
+            artifact: review-output
+            condition: always()
+
+  - stage: Publish
+    displayName: Post findings
+    dependsOn: Review
+    condition: succeeded()
+    jobs:
+      - job: publish
+        displayName: Post PR threads
+        steps:
+          - checkout: self
+            fetchDepth: 1
+            persistCredentials: false
+
+          - pwsh: Install-Module powershell-yaml -Scope CurrentUser -Force -AllowClobber
+            displayName: Install powershell-yaml
+
+          - download: current
+            artifact: review-output
+
+          - pwsh: ./agents/ALReviewAgent/scripts/Invoke-CopilotPRReview.ps1
+            displayName: Run Copilot PR review (post)
+            env:
+              REVIEW_PHASE: post
+              REVIEW_PROVIDER: azuredevops
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              GITHUB_REPOSITORY: $(Build.Repository.Name)
+              PR_NUMBER: $(System.PullRequest.PullRequestId)
+              PR_HEAD_SHA: $(System.PullRequest.SourceCommitId)
+              BASE_BRANCH: $(System.PullRequest.TargetBranchName)
+              REVIEW_WORKSPACE: $(Build.SourcesDirectory)
+              REVIEW_OUTPUT_DIR: $(Pipeline.Workspace)/review-output
+              MINIMUM_SEVERITY: $(MINIMUM_SEVERITY)
+              COPILOT_REVIEW_POST_SUMMARY: 'false'
