@@ -30,6 +30,11 @@ pool:
   vmImage: ubuntu-latest
 
 variables:
+  # Default first so the pipeline is valid before the token exists. To enable
+  # read-only isolation of the Review stage, add AZURE_DEVOPS_READ_TOKEN (a
+  # secret, Code:Read PAT) to the bc-pr-review group — the group value then wins.
+  - name: AZURE_DEVOPS_READ_TOKEN
+    value: ''
   - group: bc-pr-review
   - name: BCQUALITY_CONFIG_PATH
     value: agents/ALReviewAgent/bcquality.config.yaml
